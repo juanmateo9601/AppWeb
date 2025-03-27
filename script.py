@@ -160,6 +160,13 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment
 import streamlit as st
 
+import tempfile
+import os
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment, PatternFill, Font
+from datetime import datetime
+import streamlit as st
+
 def export_to_excel_pure(datos_resumen, selected_tecnico=None):
     """
     Llena la plantilla con las actividades > 0 desde un DataFrame (o lista de diccionarios),
@@ -213,14 +220,14 @@ def export_to_excel_pure(datos_resumen, selected_tecnico=None):
         beneficiarios = st.session_state["beneficiarios_excel"]
 
         beneficiario_encontrado = None
-        if hasattr(beneficiarios, "empty"):
+        if hasattr(beneficiarios, "empty"):  # Si es un DataFrame
             df_benef = beneficiarios.copy()
             df_benef["C.C:"] = df_benef["C.C:"].astype(str)
             df_filtrado = df_benef[df_benef["C.C:"].str.strip() == cedula_dig]
             if not df_filtrado.empty:
                 beneficiario_encontrado = df_filtrado.iloc[0].to_dict()
         else:
-            beneficiario_encontrado = next((b for b in beneficiarios
+            beneficiario_encontrado = next((b for b in beneficiarios 
                                              if str(b.get("C.C:", "")).strip() == cedula_dig), None)
 
         if beneficiario_encontrado:
@@ -234,15 +241,25 @@ def export_to_excel_pure(datos_resumen, selected_tecnico=None):
         else:
             st.write(f"No se encontró la cédula {cedula_dig} en la base de beneficiarios.")
 
+    # Agregar fecha sin sobrescribir la celda
     fecha_actual = datetime.now().strftime("%d/%m/%Y")
     append_to_cell("G4", fecha_actual)
     append_to_cell("D9", fecha_actual)
 
+    # Inyectar datos del técnico seleccionado, si se proporcionó
     if selected_tecnico:
         ws["B99"] = selected_tecnico.get("PROFESIONAL", "")
         ws["C100"] = selected_tecnico.get("CEDULA", "")
         ws["B101"] = selected_tecnico.get("CARGO", "")
 
+    # Identificar celdas combinadas para evitar escribir en ellas
+    celdas_combinadas = set()
+    for merged_range in ws.merged_cells.ranges:
+        for row in ws[merged_range.coord]:
+            for cell in row:
+                celdas_combinadas.add(cell.coordinate)
+
+    # Obtener categorías únicas a partir de los datos filtrados
     categorias_unicas = list({fila["Categoria"] for fila in datos_filtrados if fila.get("Categoria")})
     current_row = 14
 
@@ -253,27 +270,75 @@ def export_to_excel_pure(datos_resumen, selected_tecnico=None):
         ws[f"B{current_row}"].font = Font(color="000000", bold=True)
         current_row += 1
 
+        # Filtrar actividades de la categoría actual
         actividades = [f for f in datos_filtrados if f.get("Categoria") == cat]
+        # Ajustar columnas: N° en B, DESCRIPCIÓN en C, UN en D, CANT INIC en E, VR INIT en F, VR TOTAL en G
         col_map = ["B", "C", "D", "E", "F", "G"]
 
         for act in actividades:
-            valores = [act.get(k, "") for k in ["N°", "DESCRIPCIÓN", "UN", "CANT INIC", "VR INIT", "VR TOTAL"]]
+            valores = [
+                act.get("N°", ""),
+                act.get("DESCRIPCIÓN", ""),
+                act.get("UN", ""),
+                act.get("CANT INIC", 0.0),
+                act.get("VR INIT (**)", 0.0),
+                act.get("VR TOTAL", 0.0)
+            ]
             for col, val in zip(col_map, valores):
-                ws[f"{col}{current_row}"].value = val
+                celda = f"{col}{current_row}"
+                if celda not in celdas_combinadas:
+                    if col in ["F", "G"]:
+                        try:
+                            ws[celda].value = float(val)
+                            ws[celda].number_format = '"$"#,##0'
+                        except (ValueError, TypeError):
+                            ws[celda].value = 0.0
+                    else:
+                        ws[celda].value = val
+                        if col == "B":
+                            ws[celda].font = Font(color="000000", bold=False)
+                            ws[celda].hyperlink = None
             current_row += 1
+
         current_row += 1
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-        nueva_ruta = Path(tmp.name)
+        ws["G77"] = "=SUM(G15:G76)"
+        ws["G77"].number_format = '"$"#,##0'
+        
+        ws["G81"] = "=G77*0.12"
+        ws["G81"].number_format = '"$"#,##0.00'
+        
+        ws["G82"] = "=G77*0.016"
+        ws["G82"].number_format = '"$"#,##0.00'
+        
+        ws["G83"] = "=G77+G81+G82"
+        ws["G83"].number_format = '"$"#,##0.00'
+        
+        # Replicar el valor de G83 en G85 considerando celdas fusionadas
+        target = "G85"
+        found = False
+        for merged_range in ws.merged_cells.ranges:
+            if target in merged_range:
+                ws.cell(row=merged_range.min_row, column=merged_range.min_col).value = "=G83"
+                ws.cell(row=merged_range.min_row, column=merged_range.min_col).number_format = '"$"#,##0.00'
+                found = True
+                break
+        if not found:
+            ws[target].value = "=G83"
+            ws[target].number_format = '"$"#,##0.00'
+
+    # Definir la ruta de guardado (en una carpeta temporal)
+    nueva_ruta = os.path.join(tempfile.gettempdir(), "reporte_actividades.xlsx")
 
     try:
         wb.save(nueva_ruta)
-        st.success(f"✅ Reporte guardado automáticamente en: {nueva_ruta}")
+        st.write(f"✅ Reporte guardado automáticamente en: {nueva_ruta}")
     except Exception as e:
         st.error(f"❌ Error al guardar el archivo Excel: {e}")
         return None
 
     return str(nueva_ruta)
+
 
 
 
